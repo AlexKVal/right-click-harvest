@@ -12,12 +12,12 @@ import net.minecraft.core.registries.Registries;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.sounds.SoundEvent;
 import net.minecraft.sounds.SoundEvents;
 import net.minecraft.tags.ItemTags;
 import net.minecraft.tags.TagKey;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
-import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.Item;
@@ -36,6 +36,8 @@ import net.minecraft.world.phys.BlockHitResult;
 import org.jetbrains.annotations.ApiStatus.Internal;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import java.util.List;
 
 public class RightClickHarvest {
 
@@ -57,7 +59,7 @@ public class RightClickHarvest {
         JamLib.checkForJarRenaming(RightClickHarvest.class);
 
         InteractionEvent.RIGHT_CLICK_BLOCK.register(((player, hand, pos, face) -> {
-            InteractionResult res = RightClickHarvest.onBlockUse(player, player.level(), hand, new BlockHitResult(player.position(), face, pos, false), true);
+            InteractionResult res = RightClickHarvest.onBlockUse(player, hand, new BlockHitResult(player.position(), face, pos, false));
 
             return switch (res) {
                 case SUCCESS -> EventResult.interruptTrue();
@@ -69,157 +71,219 @@ public class RightClickHarvest {
     }
 
     @Internal
-    public static InteractionResult onBlockUse(Player player, Level level, InteractionHand hand, BlockHitResult hitResult, boolean initialCall) {
+    public static InteractionResult onBlockUse(Player player, InteractionHand hand, BlockHitResult hitResult) {
         if (player.isSpectator() || player.isCrouching() || hand != InteractionHand.MAIN_HAND) {
             return InteractionResult.PASS;
         }
 
-        BlockState state = level.getBlockState(hitResult.getBlockPos());
-        ItemStack stackInHand = player.getItemInHand(hand);
-        boolean hoeInUse = false;
+        BlockState state = getBlockState(player, hitResult);
 
-        // Check if the block is in the blacklist
-        if (state.is(BLACKLIST)) {
-            return InteractionResult.PASS;
-        }
+        if (isHoeRequiredWithWarning(player, state)) return InteractionResult.PASS;
 
-        // Check for hunger, if config requires it
-        if (CONFIG.get().hungerLevel != Config.HungerLevel.NONE) {
-            if (!player.getAbilities().instabuild && player.getFoodData().getFoodLevel() <= 0) {
-                return InteractionResult.PASS;
-            }
-        }
+        if (cannotHarvest(player, state)) return InteractionResult.PASS;
 
-        // Check if the block requires a hoe; if so, check if a hoe is required and if the user has one.
-        if (!state.is(HOE_NEVER_REQUIRED) && CONFIG.get().requireHoe) {
-            if (!isHoe(stackInHand)) {
-                if (isHarvestable(state) && player.level().isClientSide && !CONFIG.get().hasUserBeenWarnedForNotUsingHoe) {
-                    player.displayClientMessage(
-                          Component.translatable(
-                                "text.rightclickharvest.use_a_hoe_warning",
-                                Component.translatable("config.rightclickharvest.requireHoe").withStyle(s -> s.withColor(ChatFormatting.GREEN)),
-                                Component.literal("false").withStyle(s -> s.withColor(ChatFormatting.GREEN)
-                                )),
-                          false
-                    );
-                    CONFIG.get().hasUserBeenWarnedForNotUsingHoe = true;
-                    CONFIG.save();
-                }
+        if (canRadiusHarvest(player, state)) attemptRadiusHarvesting(player, hitResult);
 
-                return InteractionResult.PASS;
-            } else {
-                hoeInUse = true;
-            }
-        }
+        return maybeBlockHarvest(player, hitResult, state);
+    }
 
-        // If we are radius harvesting and the block cannot not be, return
-        if (!initialCall && state.is(RADIUS_HARVEST_BLACKLIST)) {
-            return InteractionResult.PASS;
-        }
+    private static BlockState getBlockState(Player player, BlockHitResult hitResult) {
+        Level level = player.level();
+        return level.getBlockState(hitResult.getBlockPos());
+    }
 
-        if (state.getBlock() instanceof CocoaBlock || state.getBlock() instanceof CropBlock || state.getBlock() instanceof NetherWartBlock) {
-            if (isMature(state)) {
-                // Start radius harvesting
-                if (initialCall && CONFIG.get().harvestInRadius && !state.is(RADIUS_HARVEST_BLACKLIST) && isHoe(stackInHand)) {
-                    int radius = 0;
-                    boolean circle = false;
-                    hoeInUse = true;
+    private static boolean canRadiusHarvest(Player player, BlockState state) {
+        return CONFIG.get().harvestInRadius && !state.is(RADIUS_HARVEST_BLACKLIST) && isHoeInHand(player) && isReplantableAndMature(state);
+    }
 
-                    if (stackInHand.is(HIGH_TIER_HOES)) {
-                        radius = 2;
-                        circle = true;
-                    } else if (stackInHand.is(MID_TIER_HOES)) {
-                        radius = 1;
-                        circle = false;
-                    } else if (stackInHand.is(LOW_TIER_HOES)) {
-                        radius = 1;
-                        circle = true;
-                    }
+    private static boolean cannotRadiusHarvest(Player player, BlockState state) {
+        return state.is(RADIUS_HARVEST_BLACKLIST) && cannotHarvest(player, state);
+    }
 
-                    if (radius == 1 && circle) {
-                        for (Direction dir : CARDINAL_DIRECTIONS) {
-                            onBlockUse(player, level, hand, hitResult.withPosition(hitResult.getBlockPos().relative(dir)), false);
-                        }
-                    } else if (radius > 0) {
-                        for (int x = -radius; x <= radius; x++) {
-                            for (int z = -radius; z <= radius; z++) {
-                                if (x == 0 && z == 0) {
-                                    continue;
-                                }
+    private static boolean cannotHarvest(Player player, BlockState state) {
+        return state.is(BLACKLIST) || isExhausted(player);
+    }
 
-                                BlockPos pos = hitResult.getBlockPos().relative(Direction.Axis.X, x).relative(Direction.Axis.Z, z);
-                                if (circle && pos.distManhattan(hitResult.getBlockPos()) > radius) {
-                                    continue;
-                                }
+    private static void maybeRadiusHarvest(Player player, BlockHitResult hitResult) {
+        BlockState state = getBlockState(player, hitResult);
+        if (cannotRadiusHarvest(player, state)) return;
+        maybeBlockHarvest(player, hitResult, state);
+    }
 
-                                onBlockUse(player, level, hand, hitResult.withPosition(pos), false);
-                            }
-                        }
-                    }
-                }
-
-                return completeHarvest(level, state, hitResult.getBlockPos(), player, hand, stackInHand, hoeInUse, true, () -> level.setBlockAndUpdate(hitResult.getBlockPos(), getReplantState(state)));
-            }
-        } else if (state.getBlock() instanceof SugarCaneBlock || state.getBlock() instanceof CactusBlock) {
-            if (hitResult.getDirection() == Direction.UP && ((stackInHand.getItem() == Items.SUGAR_CANE && state.getBlock() instanceof SugarCaneBlock) || (stackInHand.getItem() == Items.CACTUS && state.getBlock() instanceof CactusBlock))) {
-                return InteractionResult.PASS;
-            }
-
-            Block lookingFor = state.getBlock() instanceof SugarCaneBlock ? Blocks.SUGAR_CANE : Blocks.CACTUS;
-            BlockPos bottom = hitResult.getBlockPos();
-            while (level.getBlockState(bottom.below()).is(lookingFor)) {
-                bottom = bottom.below();
-            }
-
-            // Only one block tall
-            if (!level.getBlockState(bottom.above()).is(lookingFor)) {
-                return InteractionResult.PASS;
-            }
-
-            final BlockPos breakPos = bottom.above(1);
-            return completeHarvest(level, state, breakPos, player, hand, stackInHand, hoeInUse, false, () -> level.removeBlock(breakPos, false));
-        }
+    private static InteractionResult maybeBlockHarvest(Player player, BlockHitResult hitResult, BlockState state) {
+        if (isReplantableAndMature(state)) return completeHarvest(state, player, hitResult.getBlockPos());
+        if (isSugarCaneOrCactus(state)) return harvestSugarCaneOrCactus(player, hitResult, state);
 
         return InteractionResult.PASS;
     }
 
-    private static InteractionResult completeHarvest(Level level, BlockState state, BlockPos pos, Player player, InteractionHand hand, ItemStack stackInHand, boolean hoeInUse, boolean removeReplant, Runnable setBlockAction) {
-        if (!level.isClientSide) {
-            Block originalBlock = state.getBlock();
-            // Event posts are for things like claim mods
-            if (RightClickHarvestPlatform.postBreakEvent(level, pos, state, player)) {
-                return InteractionResult.FAIL;
-            }
+    private static void attemptRadiusHarvesting(Player player, BlockHitResult hitResult) {
+        int radius = 0;
+        boolean circle = false;
 
-            if (RightClickHarvestPlatform.postPlaceEvent(level, pos, player)) {
-                return InteractionResult.FAIL;
-            }
-
-            dropStacks(state, (ServerLevel) level, pos, player, player.getItemInHand(hand), removeReplant);
-            setBlockAction.run();
-
-            if (hoeInUse) {
-                stackInHand.hurtAndBreak(1, player, hand == InteractionHand.MAIN_HAND ? EquipmentSlot.MAINHAND : EquipmentSlot.OFFHAND);
-            }
-
-            // Regular block breaking causes 0.005f exhaustion
-            player.causeFoodExhaustion(0.008f * CONFIG.get().hungerLevel.modifier);
-            RightClickHarvestPlatform.postAfterHarvestEvent(new HarvestContext(player, originalBlock));
-        } else {
-            player.playSound(state.getBlock() instanceof NetherWartBlock ? SoundEvents.NETHER_WART_PLANTED : SoundEvents.CROP_PLANTED, 1.0f, 1.0f);
+        var hoeInHand = player.getMainHandItem();
+        if (hoeInHand.is(HIGH_TIER_HOES)) {
+            radius = 2;
+            circle = true;
+        } else if (hoeInHand.is(MID_TIER_HOES)) {
+            radius = 1;
+            circle = false;
+        } else if (hoeInHand.is(LOW_TIER_HOES)) {
+            radius = 1;
+            circle = true;
         }
+
+        if (radius == 1 && circle) {
+            for (Direction dir : CARDINAL_DIRECTIONS) {
+                maybeRadiusHarvest(player, hitResult.withPosition(hitResult.getBlockPos().relative(dir)));
+            }
+        } else if (radius > 0) {
+            for (int x = -radius; x <= radius; x++) {
+                for (int z = -radius; z <= radius; z++) {
+                    if (x == 0 && z == 0) {
+                        continue;
+                    }
+
+                    BlockPos pos = hitResult.getBlockPos().relative(Direction.Axis.X, x).relative(Direction.Axis.Z, z);
+                    if (circle && pos.distManhattan(hitResult.getBlockPos()) > radius) {
+                        continue;
+                    }
+
+                    maybeRadiusHarvest(player, hitResult.withPosition(pos));
+                }
+            }
+        }
+    }
+
+    private static InteractionResult harvestSugarCaneOrCactus(Player player, BlockHitResult hitResult, BlockState state) {
+        ItemStack stackInHand = player.getMainHandItem();
+        if (hitResult.getDirection() == Direction.UP && ((stackInHand.getItem() == Items.SUGAR_CANE && state.getBlock() instanceof SugarCaneBlock) || (stackInHand.getItem() == Items.CACTUS && state.getBlock() instanceof CactusBlock))) {
+            return InteractionResult.PASS;
+        }
+
+        Block lookingFor = state.getBlock() instanceof SugarCaneBlock ? Blocks.SUGAR_CANE : Blocks.CACTUS;
+        BlockPos bottom = hitResult.getBlockPos();
+        Level level = player.level();
+        while (level.getBlockState(bottom.below()).is(lookingFor)) {
+            bottom = bottom.below();
+        }
+
+        // Only one block tall
+        if (!level.getBlockState(bottom.above()).is(lookingFor)) {
+            return InteractionResult.PASS;
+        }
+
+        final BlockPos breakPos = bottom.above(1);
+        return completeHarvest(state, player, breakPos);
+    }
+
+    private static InteractionResult completeHarvest(BlockState state, Player player, BlockPos pos) {
+        Level level = player.level();
+
+        if (level.isClientSide) return playSoundClientSide(state, player);
+
+        // ==== Server Side only below ====
+
+        // Event posts are for things like claim mods
+        if (RightClickHarvestPlatform.postBreakEvent(pos, state, player)) return InteractionResult.FAIL;
+        if (RightClickHarvestPlatform.postPlaceEvent(pos, player)) return InteractionResult.FAIL;
+
+        dropStacks(state, player, pos);
+
+        Block originalBlock = state.getBlock();
+
+        if (isReplantableAndMature(state)) {
+            level.setBlockAndUpdate(pos, getReplantState(state));
+        } else if (isSugarCaneOrCactus(state)) {
+            level.removeBlock(pos, false);
+        }
+
+        wearHoeInHand(player);
+
+        // Regular block breaking causes 0.005f exhaustion
+        player.causeFoodExhaustion(0.008f * CONFIG.get().hungerLevel.modifier);
+
+        RightClickHarvestPlatform.postAfterHarvestEvent(player, originalBlock);
 
         return InteractionResult.SUCCESS;
     }
 
+    private static InteractionResult playSoundClientSide(BlockState state, Player player) {
+        player.playSound(getSoundEvent(state), 1.0f, 1.0f);
+        return InteractionResult.SUCCESS;
+    }
+
+    private static SoundEvent getSoundEvent(BlockState state) {
+        return state.getBlock() instanceof NetherWartBlock ? SoundEvents.NETHER_WART_PLANTED : SoundEvents.CROP_PLANTED;
+    }
+
+    private static boolean isHoeRequiredWithWarning(Player player, BlockState state) {
+        // Check if the block requires a hoe; if so, check if a hoe is required and if the user has one.
+        var isHoeRequired = !state.is(HOE_NEVER_REQUIRED) && CONFIG.get().requireHoe && !isHoeInHand(player);
+        if (isHoeRequired) warnOnceForNotUsingHoe(player, state);
+        return isHoeRequired;
+    }
+
+    private static void warnOnceForNotUsingHoe(Player player, BlockState state) {
+        if (CONFIG.get().hasUserBeenWarnedForNotUsingHoe || !player.level().isClientSide || !isHarvestable(state)) return;
+
+        var translatable = Component.translatable(
+                "text.rightclickharvest.use_a_hoe_warning",
+                Component.translatable("config.rightclickharvest.requireHoe").withStyle(s -> s.withColor(ChatFormatting.GREEN)),
+                Component.literal("false").withStyle(s -> s.withColor(ChatFormatting.GREEN)
+                ));
+        player.displayClientMessage(translatable, false);
+
+        CONFIG.get().hasUserBeenWarnedForNotUsingHoe = true;
+        CONFIG.save();
+    }
+
+    // Check for hunger, if config requires it
+    private static boolean isExhausted(Player player) {
+        if (player.hasInfiniteMaterials()) return false;
+        if (CONFIG.get().hungerLevel != Config.HungerLevel.NONE) return false;
+        return player.getFoodData().getFoodLevel() <= 0;
+    }
+
+    private static boolean isReplantable(BlockState state) {
+        return isReplantable(state.getBlock());
+    }
+
+    private static boolean isReplantable(Block block) {
+        return block instanceof CocoaBlock || block instanceof CropBlock || block instanceof NetherWartBlock;
+    }
+
+    private static boolean isSugarCaneOrCactus(BlockState state) {
+        Block block = state.getBlock();
+        return block instanceof SugarCaneBlock || block instanceof CactusBlock;
+    }
+
     private static boolean isHarvestable(BlockState state) {
-        if (state.getBlock() instanceof CocoaBlock || state.getBlock() instanceof CropBlock || state.getBlock() instanceof NetherWartBlock) {
-            return isMature(state);
-        } else if (state.getBlock() instanceof SugarCaneBlock || state.getBlock() instanceof CactusBlock) {
-            return true;
-        } else {
-            return false;
-        }
+        return isReplantableAndMature(state) || isSugarCaneOrCactus(state);
+    }
+
+    private static boolean isReplantableAndMature(BlockState state) {
+        return isReplantable(state) && isMature(state);
+    }
+
+    private static boolean isMature(BlockState state) {
+        Block block = state.getBlock();
+        return switch (block) {
+            case CocoaBlock cocoaBlock -> state.getValue(CocoaBlock.AGE) >= CocoaBlock.MAX_AGE;
+            case CropBlock cropBlock -> cropBlock.isMaxAge(state);
+            case NetherWartBlock netherWartBlock -> state.getValue(NetherWartBlock.AGE) >= NetherWartBlock.MAX_AGE;
+            default -> false;
+        };
+    }
+
+    private static void wearHoeInHand(Player player) {
+        ItemStack hoeInHand = player.getMainHandItem();
+        if (!isHoe(hoeInHand)) return;
+        hoeInHand.hurtAndBreak(1, player, EquipmentSlot.MAINHAND);
+    }
+
+    private static boolean isHoeInHand(Player player) {
+        return isHoe(player.getMainHandItem());
     }
 
     private static boolean isHoe(ItemStack stack) {
@@ -230,44 +294,31 @@ public class RightClickHarvest {
                || RightClickHarvestPlatform.isHoeAccordingToPlatform(stack);
     }
 
-    private static boolean isMature(BlockState state) {
-        if (state.getBlock() instanceof CocoaBlock) {
-            return state.getValue(CocoaBlock.AGE) >= CocoaBlock.MAX_AGE;
-        } else if (state.getBlock() instanceof CropBlock cropBlock) {
-            return cropBlock.isMaxAge(state);
-        } else if (state.getBlock() instanceof NetherWartBlock) {
-            return state.getValue(NetherWartBlock.AGE) >= NetherWartBlock.MAX_AGE;
-        }
-
-        return false;
-    }
-
     private static BlockState getReplantState(BlockState state) {
-        if (state.getBlock() instanceof CocoaBlock) {
-            return state.setValue(CocoaBlock.AGE, 0);
-        } else if (state.getBlock() instanceof CropBlock cropBlock) {
-            return cropBlock.getStateForAge(0);
-        } else if (state.getBlock() instanceof NetherWartBlock) {
-            return state.setValue(NetherWartBlock.AGE, 0);
-        }
-
-        return state;
+        Block block = state.getBlock();
+        return switch (block) {
+            case CocoaBlock cocoaBlock -> state.setValue(CocoaBlock.AGE, 0);
+            case CropBlock cropBlock -> cropBlock.getStateForAge(0);
+            case NetherWartBlock netherWartBlock -> state.setValue(NetherWartBlock.AGE, 0);
+            default -> state;
+        };
     }
 
-    private static void dropStacks(BlockState state, ServerLevel world, BlockPos pos, Entity entity, ItemStack toolStack, boolean removeReplant) {
-        Item replant = state.getBlock().getCloneItemStack(world, pos, state).getItem();
-        final boolean[] removedReplant = {!removeReplant};
+    private static void dropStacks(BlockState state, Player player, BlockPos pos) {
+        ServerLevel world = (ServerLevel) player.level();
+        List<ItemStack> drops = Block.getDrops(state, world, pos, null, player, player.getMainHandItem());
+        Block block = state.getBlock();
+        Item replant = block.asItem();
+        boolean needToReplant = isReplantable(block);
 
-        Block.getDrops(state, world, pos, null, entity, toolStack).forEach(stack -> {
-            if (!removedReplant[0] && stack.getItem() == replant) {
-                stack.setCount(stack.getCount() - 1);
-                removedReplant[0] = true;
+        for (ItemStack droppedStack : drops) {
+            if (needToReplant && droppedStack.is(replant)) {
+                droppedStack.shrink(1);
+                needToReplant = false;
             }
 
-            Block.popResource(world, pos, stack);
-        });
-
-        state.spawnAfterBreak(world, pos, toolStack, true);
+            Block.popResource(world, pos, droppedStack);
+        }
     }
 
     private static ResourceLocation id(String path) {
